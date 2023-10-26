@@ -1,0 +1,988 @@
+---
+title: Procesamiento para generar la red hidrográfica y la cuenca del río Yaque del Norte, República Dominicana y Haití, a partir de modelo digital de elevaciones de resolución media
+authors:
+  - name: José-Ramón Martínez-Batlle\orcidlink{0000-0001-9924-0327}
+    department: Facultad de Ciencias
+    affiliation: Universidad Autónoma de Santo Domingo (UASD)
+    location:  Santo Domingo, República Dominicana
+    email: joseramon@geografiafisica.org
+abstract: |
+  Enter the text of your abstract here.
+keywords:
+  - modelo digital de elevaciones
+  - análisis hidrológico
+  - Procesamiento de datos geoespaciales
+  - hidrología computacional
+bibliography: references.bib
+csl: apa-es.csl
+lang: es
+output: rticles::arxiv_article
+editor_options: 
+  chunk_output_type: console
+always_allow_html: true
+header-includes:
+  \usepackage{orcidlink}
+  \usepackage{float}
+  \renewcommand\tablename{Tabla}
+  \renewcommand\figurename{Figura}
+  \usepackage[all]{nowidow}
+  \usepackage{xcolor}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  cache = FALSE, 
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  out.width = '100%',
+  # res = 300,
+  dpi = 300
+  # fig.pos = "H", out.extra = "" #Figuras en el lugar insertadas
+  )
+# options(digits = 3)
+```
+
+
+```{r suphidropaquetes}
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("distance", "raster")
+conflicted::conflict_prefer("alpha", "ggplot2")
+conflicted::conflict_prefer("rescale", "scales")
+library(psych)
+library(raster)
+library(sf)
+library(kableExtra)
+library(tidyverse)
+library(gdalUtilities)
+library(e1071)
+library(scales)
+library(tmap)
+library(janitor)
+library(ggrepel)
+# library(ggsflabel)
+library(spanish)
+devtools::source_url('https://raw.githubusercontent.com/geofis/red-hidrografica-densa-rd/master/R/funciones.R')
+rm(list = grep('RR_*', ls(), value = T)) #Borrar resúmenes sesión anterior
+ruta_fuentes <- 'fuentes'
+dem_proc_dir <- 'salidas'
+figuras <- 'figuras'
+umbral_espurias <- 4000 #Umbral por debajo del cual se considera una cuenca como espuria
+```
+
+El DEM fue reproyectado desde EPSG:4326 a EPSG:32619, generándose el archivo `mosaico-32619.tif`. Este último fue poteriormente suavizado con *FeaturePreserveSmoothing* de Whitebox Tools en QGIS, generándose el archivo mosaico-suavizado.tif. Este será el que se usará para crear la región de GRASS.
+
+
+
+```{bash, eval=F}
+# Crear región de GRASS
+#grass --text -c mosaico-suavizado.tif ./grassdata
+# Luego de creada, abrir con:
+#grass ./grassdata/PERMANENT/
+
+# Importar DEM
+#r.import input=mosaico-suavizado.tif output=mosaico_suavizado
+
+# Ver en lista (q para salir)
+# g.list type=raster
+
+# Ver atributos de la región
+g.region -p
+
+# Borrar mascara (si la hubiere)
+r.mask -r
+
+#Estadísticos univariados
+r.univar --overwrite -te \
+  map=mosaico_suavizado \
+  output=stats_mosaico_suavizado.txt
+```
+
+
+```{r, message=F, warning=F}
+stats_mosaico_suavizado <- read_delim(
+  paste0(dem_proc_dir, '/',
+         'stats_mosaico_suavizado.txt'),
+  progress = F, show_col_types = F)
+```
+
+Importo el vectorial de cursos fluviales en general a la región de GRASS.
+
+
+```{bash, eval=F}
+# Importar red a GRASS
+# IMPORTANTE: la red en el GPKG que se desea tallar, debe tener "1" en el campo "rasterizar"
+v.import --overwrite input=../fuentes/red_mtn50k_cleaned_largos.gpkg \
+  output=cursos_fluviales
+# Ver mapa importado en lista (q para salir)
+# g.list type=vector
+# Calcular y pasar a archivo, la longitud de cursos
+# y número de segmentos (ejecutar en casos de actualización)
+v.to.db -p option=length map=cursos_fluviales > \
+  stats_cursos_fluviales.txt
+```
+
+```{r, message=F, warning=F}
+stats_cursos_fluviales <- read_delim(
+  paste0(dem_proc_dir, '/',
+         'stats_cursos_fluviales.txt'),
+  progress = F, show_col_types = F)
+n_seg_cursos_fluviales <- stats_cursos_fluviales %>%
+  filter(!cat==-1) %>% nrow
+length_cursos_fluviales_km <- stats_cursos_fluviales %>%
+  filter(!cat==-1) %>% pull(length) %>% sum/1000
+```
+
+
+El siguiente paso consistió en realizar el *stream burning* (tallado) de la red de cursos seleccionados usando álgebra de mapas con la herramienta `r.mapcalc` de GRASS GIS [@GRASS_GIS_software; @grassdev2022rmapcalc; @shapiro1994rmapcalc; @larson1991performing]. Para tallar con álgebra de mapas, primero normalizamos el DEM, generamos una capa booleana ráster con la red de cursos seleccionados, la restamos al DEM normalizado y luego, para restablecer los valores originales fuera de las áreas talladas, multiplicamos el ráster resultante de la resta nuevamente por el rango del DEM (máximo - mínimo). El resultado es un DEM tallado, en el que sólo los píxeles por donde circula la red quedaron con una profundidad equivalente al rango. Esta método resulta ser muy eficiente y, al mismo tiempo, modifica poco los patrones generales observados en el DEM.
+
+```{bash, eval=F}
+# Tallar con álgebra de mapas
+# Antes de comenzar, limpiar red manualmente en QGIS
+# Para mejorar la topología, se puede aplicar v.clean directamente en QGIS
+# Primero, rasterizar red (los píxeles de la red valdrán 1, el resto, nulo)
+v.to.rast --overwrite \
+  input=cursos_fluviales type=line use=attr \
+  attribute_column=rasterizar \
+  output=cursos_fluviales \
+  memory=12000
+# La columna "rasterizar" es 0 para cursos que no se rasterizan
+# Luego convertir nulos a cero
+r.null map=cursos_fluviales null=0
+# A continuación, determinar estadísticas univariantes del DEM
+# confirmar que no sufre gran modificación de sus valores extremos
+r.univar map=mosaico_suavizado
+# minimum: -13
+# maximum: 3104.93
+# Finalmente, aplicar el tallado mediante normalización y resta con r.mapcalc
+time r.mapcalc --overwrite << EOF
+eval(stddem = (mosaico_suavizado - -5.88294) / (3104.93 - -13), \
+     stddemburn = stddem - cursos_fluviales)
+mosaico_tallado = (stddemburn * (3104.93 - -13)) - 13
+EOF
+```
+
+## Suplemento meotodológico para la subsección "Procesamiento de hidrología computacional" {.unnumbered}
+
+Previo al inicio de los análisis hidrológicos, aplicamos una máscara ajustada a la cuenca del río Yaque del Norte. Para delimitar la cuenca, primero fue necesario generar un mapa de dirección de drenaje con `r.watershed`.
+
+```{bash, eval=F}
+# Dirección de flujo para extraer cuenca y usarla como máscara
+time r.watershed --overwrite --verbose elevation=mosaico_tallado \
+ accumulation=rwshed_acum \
+ threshold=80 \
+ drainage=rwshed_direccion_drenaje \
+ stream=rwshed_drenaje \
+ memory=12000
+```
+
+Posteriormente, obtuvimos las coordenadas de la desembocadura del río Yaque del Norte, a partir del archivo de red de cursos grabados sobre el DEM (el comando de Bash usado sólo funciona con archivos de un único punto). Con estas coordenadas, y el mapa de dirección de drenaje, generamos el límite de la cuenca con `r.water.outlet`, primero en formato ráster y luego lo convertimos a vectorial (no es imprescindible, pero lo hicimos para fines de consistencia), para finalmente aplicar la máscara restringida al límite de la cuenca. Luego de aplicada la máscara, todos los análisis se centraron en la cuenca del río Yaque del Norte.
+
+```{bash, eval=F}
+# Obtiene la coordenada x (falso este)
+desembocadura_x=$(ogrinfo -al -so desembocadura-yaque-del-norte.gpkg |\
+  grep Extent | sed -n 's/Extent: (\([^,]*\), .*/\1/p')
+
+# Obtiene la coordenada y (falso norte)
+desembocadura_y=$(ogrinfo -al -so desembocadura-yaque-del-norte.gpkg |\
+  grep Extent | sed -n 's/Extent: ([^,]*, \([^)]*\)).*/\1/p')
+
+# Generar finalmente la cuenca
+r.water.outlet --overwrite input=rwshed_direccion_drenaje \
+  output=mascara coordinates=`echo "$desembocadura_x,$desembocadura_y"`
+
+# Vectorizar
+r.to.vect --overwrite input=mascara \
+      output=mascara type=area
+
+# Fijar máscara
+r.mask -r
+r.mask vector=mascara
+```
+
+A partir de este punto, todos los cómputos se realizan dentro del límite de la cuenca del río Yaque del Norte. Primero extrajimos el mapa de acumulación de flujo, para usarlo en scripts posteriores de la familia `r.stream*`.
+
+```{bash, eval=F}
+# Acumulación de flujo
+time r.watershed --overwrite --verbose elevation=mosaico_tallado \
+ accumulation=rwshed_acum \
+ threshold=60 stream=rwshed_talwegs \
+ memory=12000
+# El umbral 60 se usó en la extracción de una red de muestra, como forma de
+# previsualizar una hidrografía inicial, no para generar la red definitiva.
+# Dependiendo de la aplicación deseada, otras salidas del addon son:
+# basin=rwshed_cuencas \
+# half_basin=rwshed_hemicuenca \
+# tci=rwshed_tci spi=rwshed_spi \
+# length_slope=rwshed_longitud_vertiente \
+# slope_steepness=rwshed_empinamiento \
+# retention=rwshed_retencion_flujo \
+# max_slope_length=rwshed_max_longitud_vertiente \
+```
+
+Usando como insumos el DEM y el mapa de acumulación producido por `r.watershed`, obtuvimos la red hidrográfica utilizando `r.stream.extract`. Esta etapa requirió la evaluación de umbrales de acumulación óptimos a través de inspección visual. El umbral de acumulación es un área de debate en hidrología computacional. Nos enfocamos en la evaluación de criterios para la extracción de *talwegs* en un sentido amplio, sin considerarlos como cursos fluviales permanentes. Reconocemos que la determinación de la permanencia fluvial requeriría un análisis detallado de las características individuales de cada cuenca, incluyendo aspectos como la pendiente, tamaño, litología y clima.
+
+Siguiendo las mejores prácticas, realizamos diversas ejecuciones del complemento `r.stream.extract` usando varios umbrales para identificar la red hidrográfica más adecuada en nuestra área de interés [@marchesini2021; @freeman1991calculating; @jasiewicz2011]. Para seleccionar un umbral de acumulación óptimo, consideramos cuatro criterios: consistencia con estudios similares, suficiente densidad de red, evitar una generalización excesiva de la red, y prevenir una red demasiado densa que incluya áreas sin características hidrológicas mínimas. Dado que nuestro DEM tiene una resolución espacial de 12.5 m, examinamos diferentes umbrales para obtener una red hidrográfica adecuada. En `r.stream.extract`, optamos por los umbrales de acumulación de 60, 80 y 100 celdas, equivalentes a 3, 8 y 14 hectáreas de superficie, respectivamente. Estos umbrales están en línea con los utilizados en estudios que consultamos, donde se evaluaron áreas propensas a inundaciones y cuencas de captación [@freeman1991calculating; @marchesini2021].
+
+El código necesario para generar las distintas redes evaluadas lo implementamos mediante un bucle `for` en Bash para mayor eficiencia y consistencia en el procesamiento. Hicimos que el bucle iterara automáticamente sobre los tres umbrales de acumulación, usando los valores de umbral como iterador (`i={60..100..20}`, debe leerse como "itera desde 60 a 100 en incrementos de 20 enteros", resultando en los valores 60, 80 y 100), el cual pasamos como argumento del parámetro `threshold`. Finalmente, para cada red generada con los distintos umbrales, calculamos la longitud de cursos fluviales, actualizamos la base de datos de GRASS GIS y generamos un archivo de texto resumen que posteriormente importamos a R para obtener estadísticos básicos.
+
+```{bash, eval=F}
+# Extraer redes de drenaje para tres umbrales de acumulación distintos
+# En bucle
+for i in `echo {60..100..20}`; \
+  do echo -e "\nTRABAJANDO EL UMBRAL DE ACUMULACIÓN $i ...\n"; \
+  time r.stream.extract --overwrite elevation=mosaico_tallado accumulation=rwshed_acum \
+    threshold=$i \
+    stream_vector=rstream_talwegs_umbral_$i stream_raster=rstream_talwegs_umbral_$i \
+    direction=rstream_direccion_umbral_$i memory=12000; \
+done
+# Calcular estadísticos, y pasar a archivo
+for i in `echo {60..100..20}`; \
+  do v.to.db -p option=length map=rstream_talwegs_umbral_$i >\
+    stats_length_rstream_talwegs_umbral_$i.txt;
+done
+```
+
+```{r, message=F, warning=F}
+stats_rstream_talwegs <- sapply(as.character(c(60, 80, 100)), function(x) 
+  read_delim(paste0(dem_proc_dir, '/', 'stats_length_rstream_talwegs_umbral_', x, '.txt'),
+             progress = F, show_col_types = F), simplify = F)
+n_rstream_talwegs <- stats_rstream_talwegs %>% 
+  map(~ .x %>% filter(!cat==-1) %>% nrow) %>% unlist
+length_rstream_talwegs <- stats_rstream_talwegs %>%
+  map(~ .x %>% filter(!cat==-1) %>% pull(length) %>% sum/1000) %>% unlist
+```
+
+Evaluamos los resultados y recopilamos los estadísticos esenciales de cada red formada con los distintos umbrales. Para los umbrales de 60, 80 y 100 celdas, se obtuvieron **`r vector_a_lista(format(n_rstream_talwegs, scientific=F))` segmentos** correspondientemente, acumulando **`r vector_a_lista(format(length_rstream_talwegs, scientific=F, digits=1))` kilómetros** de longitud en cada caso (estos valores excluyen una pequeña fracción del total fuera de la máscara). Para cada una de las redes, evaluamos el grado de alineación con nuestros criterios de selección de la red óptima, tras lo cual elegimos la red generada con el umbral de acumulación de 80 celdas. Sin embargo, mantuvimos las restantes en la base de datos y les aplicamos todos los subsiguientes algoritmos de análisis de hidrología computacional, hasta alcanzar los resultados finales.
+
+Posteriormente, calculamos el orden jerárquico de la red hidrográfica, proceso que repetimos para cada uno de los umbrales de acumulación que definimos previamente, es decir, 60, 80 y 100 celdas. Al igual que en casos anteriores, utilizamos un bucle en Bash para iterar automáticamente sobre los tres umbrales de acumulación; en este caso, los valores del índice se correspondían con los sufijos de los mapas de entrada (`_$i`). El núcleo del bucle, en este caso, contiene la ejecución del complemento `r.stream.order` de GRASS GIS. Este complemento se invoca con una serie de argumentos que especifican los mapas de entrada y salida que se deben usar en el cálculo. De manera específica, le proporcionamos el mapa de *talwegs* o cursos (parámetro `stream_rast`), el mapa de dirección de drenaje (`direction`), el mapa de elevación (`elevation`), y el mapa de acumulación (`accumulation`), todos correspondientes al umbral de acumulación que está siendo procesado en cada iteración. Adicionalmente, especificamos los nombres de los mapas de salida que contienen el orden de red según los métodos de Strahler y Horton (argumentos `strahler` y `horton`) [@horton1945erosional; @strahler1957quantitative], así como el mapa de topología (`topo`) y el vectorial de salida (`stream_vect`).
+
+```{bash, eval=F}
+# Extraer orden de red en bucle
+for i in `echo {60..100..20}`; \
+  do echo -e "\nTRABAJANDO EL UMBRAL DE ACUMULACIÓN $i ...\n"; \
+  time r.stream.order --overwrite stream_rast=rstream_talwegs_umbral_$i \
+    direction=rstream_direccion_umbral_$i \
+    elevation=mosaico_tallado accumulation=rwshed_acum \
+    stream_vect=rstream_orden_de_red_umbral_$i \
+    strahler=rstream_orden_strahler_de_red_umbral_$i \
+    horton=rstream_orden_horton_de_red_umbral_$i \
+    topo=topologia_orden_umbral_$i memory=12000; \
+done
+```
+
+Corregimos la topología con `v.clean`, pero sólo para la red generada con el umbral de acumulación de 80 celdas. Eliminamos los cursos con longitud 0 metros y actualizamos la longitud de cada curso en el campo `length` usando el complemento `v.to.db`.
+
+```{bash, eval=F}
+v.clean --overwrite layer=1 \
+  input=rstream_orden_de_red_umbral_80 \
+  output=rstream_orden_de_red_umbral_80_cleaned \
+  tool=rmline
+v.to.db --overwrite option=length type=line columns=area \
+  map=rstream_orden_de_red_umbral_80_cleaned
+```
+
+Para completar la caracterización de las redes de drenaje, empleamos dos enfoques distintos: exploración visual y análisis estadístico. Para la exploración visual, usamos el mapa de la red y lo desplegamos en QGIS.  Para la obtención de resultados analíticos, usamos el addon `r.stream.stats`, con el que calculamos los estadísticos de las redes jerarquizadas---longitud de tramos, área drenada, pendientes, razón de bifurcación----creadas con el addon `r.stream.order`. Mostramos a continuación las instrucciones necesarias para obtener los estadísticos mediante `r.stream.stats` El archivo de texto resultante lo utilizamos en los análisis estadísticos posteriores en una sesión de `R`.
+
+```{bash, eval=F}
+# Salida resumen
+r.stream.stats --overwrite -o \
+  stream_rast=rstream_orden_strahler_de_red_umbral_80 \
+  direction=rstream_direccion_umbral_80 \
+  elevation=mosaico_suavizado \
+  output=stats_rstream_order_strahler_red_umbral_80_horton.txt \
+  memory=12000
+# Salida desagregada
+r.stream.stats --overwrite \
+  stream_rast=rstream_orden_strahler_de_red_umbral_80 \
+  direction=rstream_direccion_umbral_80 \
+  elevation=mosaico_suavizado \
+  output=stats_rstream_order_strahler_red_umbral_80.txt \
+  memory=12000
+```
+
+A continuación, delimitamos cuencas y subcuencas según la jerarquía de red, con independencia de si tratara de cuencas tributarias o no, para lo cual usamos el complemento `r.stream.basins` especificando la opción (*flag*) `-c`, que utiliza una secuencia única de categorías (en nuestro caso, órdenes) para delimitar las cuencas en lugar de flujos de entrada. En este caso, construimos un bucle `for` doble, anidando el orden de red dentro del umbral de acumulación. Así, para cada uno de los mapas de redes hidrográficas según los tres umbrales de acumulación, delimitamos las cuencas de cada uno de los órdenes de Strahler disponibles. Al utilizar el criterio orden de red, las unidades delimitadas por este procedimiento incluyen tanto cuencas completas como subcuencas (tributarias), por lo que la mayoría contiene redes de drenaje tributarias (ríos que desembocan en otros ríos).
+
+```{bash, eval=F}
+# Delimitar cuencas según jerarquía
+# En bucle
+time for i in `echo {60..100..20}`; \
+  do for j in `echo {1..8..1}`; \
+    do echo -e "\nTRABAJANDO EL UMBRAL DE ACUMULACIÓN $i, orden $j...\n"; \
+    r.stream.basins -c --overwrite direction=rstream_direccion_umbral_$i \
+      stream_rast=rstream_orden_strahler_de_red_umbral_$i cats=$j \
+      basins=rstream_cuencas_strahler_umbral_${i}_orden_$j memory=32000; \
+  done; \
+done
+```
+
+Posteriormente, delimitamos las cuencas con desembocadura en mares, lagos, lagunas o en pérdidas kársticas. En esta sección aplicamos el mismo complemento que en el paso anterior (`r.stream.basins`) en bucle doble anidado, pero en esta ocasión especificamos la opción `-l`. Es decir, delimitamos las cuencas completas, cuya red desemboca en el mar (exorreicas), o en lagos, lagunas y pérdidas del karst (endorreicas), y excluimos las subcuencas de redes tributarias (eg. red cuyo curso principal desemboca en otro río). Por lo tanto, se trata de cuencas propiamente en la acepción más formal del término, que significa que no existe---o no se conoce ni se puede detectar con información disponible---prolongación del drenaje superficial fuera de ellas.
+
+```{bash, eval=F}
+# Delimitar cuencas terminales
+# En bucle
+time for i in `echo {60..100..20}`; \
+  do for j in `echo {1..8..1}`; \
+    do echo -e "\nTRABAJANDO EL UMBRAL DE ACUMULACIÓN $i, orden $j...\n"; \
+    r.stream.basins -lc --overwrite direction=rstream_direccion_umbral_$i \
+      stream_rast=rstream_orden_strahler_de_red_umbral_$i cats=$j \
+      basins=rstream_cuencas_strahler_terminal_umbral_${i}_orden_$j memory=12000; \
+  done; \
+done
+```
+
+Como último paso en la producción de resultados, convertimos las cuencas a modelo de datos vectorial, pero para evitar agrandar la base de datos innecesariamente, elegimos sólo las cuencas generadas para el umbral de 80 celdas. Los vectoriales resultantes nos permitieron un mejor manejo de los datos para análisis y representación de la cuencas. Describimos el procedimiento detallado a continuación.
+
+Comenzamos la vectorización ejecutando un bucle para convertir cada capa ráster de cuencas terminales correspondiente a cada orden de red (desde 1 a 8) en un mapa vectorial de tipo área. Para realizar esta conversión, utilizamos el complemento `r.to.vect` de GRASS GIS, añadiendo también una nueva columna llamada `strahler` a la tabla de atributos de cada capa vectorial, que luego actualizamos con el valor del orden de red Strahler correspondiente. Después de procesar las cuencas de cada orden, fusionamos todas las capas vectoriales en una sola utilizando el complemento `v.patch`. Esto produjo una única capa vectorial conteniendo información sobre todas las cuencas terminales para todos los órdenes Strahler. Es importante aclarar que sólo fueron propiamente clasificadas como polígonos con de orden de red, aquellas las áreas del ráster que contaban con categorías asignadas (e.g. píxeles con valor 1 a 8), es decir, aquellas a las que el algoritmo `r.stream.basins` asignó un orden de red debidamente. Las áreas que formaban el fondo (e.g. píxeles con valor cero), que corresponden a espacios con drenaje hacia depresiones sin pertenencia a jerarquía alguna, conforman la capa "0" del mapa vectorial generado (`rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned 0`). Por esta razón, el mapa vectorial de cuencas generado, presenta espacios vacíos; si hiciera falta recuperar dichos espacios, bastaría con cargar la referida capa "0", tomando en consideración que sus elementos no cuentan con atributos aprovechables.
+
+Luego, limpiamos y preparamos los datos para el análisis. Primero, corregimos la topología y actualizamos el área de cada cuenca usando el complemento `v.clean`. Eliminamos las áreas inferiores a `r format(umbral_espurias, scientific=F, digits=1)`&nbsp;m\textsuperscript{2} (cuencas espurias) para mejorar la calidad de los datos. Posteriormente, eliminamos los registros con un valor de área nulo (artefactos). Estas etapas de limpieza y preparación son críticas para garantizar la precisión y relevancia de nuestros resultados.
+
+Finalmente, seleccionamos las filas válidas---las que tenían un valor de categoría distinto de -1---de la tabla de atributos de nuestra capa vectorial final, y exportamos estos datos a un archivo de texto. Este archivo de texto contiene estadísticas del área para cada cuenca terminal según orden Strahler, lo cual nos proporcionó información valiosa para nuestro análisis posterior.
+
+```{bash, eval=F}
+time for i in `echo {1..8..1}`; \
+# Cuencas y subcuencas según orden
+  do echo -e "\nTRABAJANDO EL ORDEN $i...\n"; \
+    r.to.vect --overwrite input=rstream_cuencas_strahler_umbral_80_orden_$i \
+      output=rstream_cuencas_strahler_umbral_80_orden_$i type=area; \
+    v.db.addcolumn rstream_cuencas_strahler_umbral_80_orden_$i \
+      columns="strahler int"; \
+    v.db.update rstream_cuencas_strahler_umbral_80_orden_$i \
+      col=strahler value=$i where="strahler IS NULL"; \
+    # Calcular estadisticos, y pasar a archivo
+    ## Preparación de fuentes (corrección de topología >
+    ##                         actualización de área >
+    ##                         eliminar registros)
+    v.clean --overwrite layer=1 \
+      input=rstream_cuencas_strahler_umbral_80_orden_$i \
+      output=foo \
+      tool=rmarea threshold=4000
+    v.to.db --overwrite option=area type=centroid columns=area \
+      map=foo
+    v.db.droprow --overwrite \
+      input=foo \
+      output=rstream_cuencas_strahler_umbral_80_orden_$i where="area IS NULL"
+    g.remove -f type=vector \
+    name=foo
+done
+
+# Limpiando las cuencas de órdenes 2 y 3 de menos de 60,000 m2
+for i in `echo {2..3..1}`; \
+  do v.db.droprow --overwrite \
+    input=rstream_cuencas_strahler_umbral_80_orden_$i \
+    output=foo \
+    where="area <= 6e4";
+    g.rename --overwrite \
+      vector=foo,rstream_cuencas_strahler_umbral_80_orden_$i; \
+    g.remove -f type=vector name=foo; \
+done
+
+# Cuencas terminales
+time for i in `echo {1..8..1}`; \
+  do echo -e "\nTRABAJANDO EL ORDEN $i...\n"; \
+    r.to.vect --overwrite input=rstream_cuencas_strahler_terminal_umbral_80_orden_$i \
+      output=rstream_cuencas_strahler_terminal_umbral_80_orden_$i type=area; \
+    v.db.addcolumn rstream_cuencas_strahler_terminal_umbral_80_orden_$i \
+      columns="strahler int"; \
+    v.db.update rstream_cuencas_strahler_terminal_umbral_80_orden_$i \
+      col=strahler value=$i where="strahler IS NULL"; \
+done
+
+# Unir cuencas terminales
+v.patch -e --overwrite \
+  input=`g.list type=v pattern='rstream_cuencas_strahler_terminal_umbral_80_orden_*' \
+    separator=comma` \
+  output=rstream_cuencas_strahler_terminal_umbral_80_todos
+
+
+# Corregir topología, excluir espurias, calcular estadísticos, y pasar a archivo
+## Corrección de topología
+v.clean --overwrite layer=1 input=rstream_cuencas_strahler_terminal_umbral_80_todos \
+  output=rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned \
+  tool=rmarea threshold=4000
+## Actualización de área
+v.to.db --overwrite option=area type=centroid columns=area \
+  map=rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned
+## Eliminar registros
+v.db.droprow --overwrite rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned \
+  output=foo where="area IS NULL"
+## Renombrar mapa a original
+g.rename --overwrite \
+  vector=foo,rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned
+## Eliminar temporal
+g.remove -f type=vector name=foo
+## Excluir cuencas strahler>=4 y area<=1e6
+v.db.droprow --overwrite rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned \
+  output=foo \
+  where="strahler >= 4 and area <= 1e6"
+## Renombrar mapa a original
+g.rename --overwrite \
+  vector=foo,rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned
+## Eliminar temporal
+g.remove -f type=vector name=foo
+## Generar tabla
+v.db.select --overwrite rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned \
+  where='cat!=-1' > stats_area_rstream_cuencas_strahler_terminal_umbral_80_todos.txt
+
+
+# Generar salidas GPKG y SHP para cuencas terminales
+## Exportar el mapa 'rstream_orden_de_red_umbral_80_cleaned' a GeoPackage
+v.out.ogr --overwrite \
+  input=rstream_orden_de_red_umbral_80_cleaned \
+  output=gpkg-shp/rstream_orden_de_red_umbral_80_cleaned.gpkg \
+  type=line \
+  format=GPKG
+## Exportar el mapa 'rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned'
+## a GeoPackage
+v.out.ogr --overwrite \
+  input=rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned \
+  output=gpkg-shp/rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned.gpkg \
+  type=area \
+  format=GPKG
+## Exportar el mapa 'rstream_orden_de_red_umbral_80_cleaned' a Shapefile
+## Nota: algunos valores de área de objetos no se transfieren bien al formato SHP
+ogr2ogr -f "ESRI Shapefile" \
+  gpkg-shp/rstream_orden_de_red_umbral_80_cleaned.shp \
+  gpkg-shp/rstream_orden_de_red_umbral_80_cleaned.gpkg
+## Exportar el mapa 'rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned'
+## a Shapefile
+## Nota: algunos valores de área de objetos no se transfieren bien al formato SHP
+ogr2ogr -f "ESRI Shapefile" \
+  gpkg-shp/rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned.shp \
+  gpkg-shp/rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned.gpkg
+
+
+# Generar salidas GPKG y SHP para cuencas y subcuencas
+## Exportar mapas 'rstream_cuencas_strahler_umbral_80_orden_$i' a GeoPackage
+for i in `echo {1..8..1}`; \
+  do echo -e "\nTRABAJANDO EL ORDEN $i...\n"; \
+    v.out.ogr --overwrite \
+     input=rstream_cuencas_strahler_umbral_80_orden_$i \
+     output=gpkg-shp/rstream_cuencas_strahler_umbral_80_orden_$i.gpkg \
+     type=area \
+     format=GPKG
+done
+
+# Sentencias útiles para borrar vectoriales y rásters
+# g.remove -f type=raster pattern=rstream_cuencas_strahler_terminal_umbral_* exclude=*orden_7
+# g.remove -f type=vector pattern=rstream_cuencas_strahler_terminal_umbral_*_orden* exclude=*orden_7
+# g.remove -f type=raster pattern=rstream_cuencas_strahler_umbral_80_orden_8
+# g.remove -f type=vector pattern=rstream_cuencas_strahler_umbral_80_orden_8
+```
+
+
+!!!!EJECUTADO HASTA AQUÍ!!!!
+
+
+```{r, message=F, warning=F}
+stats_rstream_cuencas_80 <- read_delim(
+  paste0(dem_proc_dir, '/',
+         'stats_area_rstream_cuencas_strahler_terminal_umbral_80_todos.txt'),
+  progress = F, show_col_types = F) %>% 
+  rename(`Orden de red (Strahler)` = strahler)
+stats_rstream_cuencas_80_estadisticos <- stats_rstream_cuencas_80 %>% 
+  group_by(`Orden de red (Strahler)`)  %>%
+  summarise(`Número de cuencas` = n(),
+            `Área promedio (km$^2$)` = mean(area),
+            `Área promedio (km$^2$), error est.` = sd(area)/sqrt(length(area)),
+            `Área total (km$^2$)` = sum(area))
+rstream_cuencas_80_por_orden_tabla <- stats_rstream_cuencas_80_estadisticos  %>%
+  mutate_at(vars(starts_with("Área")), list(~./1000000)) %>%
+  mutate(across(where(is.numeric), ~ signif(.x, digits = 4))) %>% 
+  mutate(`Área promedio (km$^2$) (error est.)` = paste0(
+    `Área promedio (km$^2$)`, ' (',
+    `Área promedio (km$^2$), error est.`, ')'
+  )) %>% 
+  select(-`Área promedio (km$^2$)`, -`Área promedio (km$^2$), error est.`) %>% 
+  adorn_totals(,,,, matches('Número|total'))
+rstream_cuencas_80_por_orden_p <- stats_rstream_cuencas_80_estadisticos %>% 
+  ggplot + aes(x = `Orden de red (Strahler)`, y = `Número de cuencas`) +
+  geom_line() + ylab('Número de cuencas (log2)') +
+  scale_y_continuous(trans='log2') +
+  theme_bw() +
+  theme(text = element_text(size = 18))
+```
+
+## Suplemento para la sección "Resultados"
+
+Realizamos análisis estadísticos de las cuencas terminales. Se necesita descargar el comprimido con los [datos del estudio](https://doi.org/10.5281/zenodo.8146391), colocar el directorio `gpkg-shp` en el directorio raíz de este repo. Como medida de seguridad, excluimos cuencas con orden de red cuatro o mayor y con área menor 1\ \textsuperscript{2}. Posteriormente, generamos un nuevo objeto de cuencas de orden cuatro o mayor para análisis focalizados, así como objetos de cuencas y subcuencas de todos los órdenes, y obtuvimos estadísticos básicos (la asimetría y la curtosis son $G_1$ y $G_2$, respectivamente, del trabajo de @joanes1998comparing).
+
+```{r}
+# Cuencas terminales
+cuencas <- st_read(
+  dsn = 'gpkg-shp/rstream_cuencas_strahler_terminal_umbral_80_todos_cleaned.gpkg',
+  quiet = T)
+cuencas4mas <- cuencas[cuencas$strahler >= 4, ]
+# Cuencas y subcuencas
+cuencas_subcuencas <- sapply(as.character(1:7), function(x) {
+  st_read(
+    dsn = paste0('gpkg-shp/rstream_cuencas_strahler_umbral_80_orden_', x, '.gpkg'),
+    quiet = T)
+  }, USE.NAMES = T, simplify = F)
+cuencas_sub_areas_ordenes <- map(cuencas_subcuencas,
+                         ~.['area'] %>% st_drop_geometry %>%
+                           pull(area) %>% as_tibble %>%
+                           mutate(`Área (kilómetros cuadrados)` = value/1e6,
+                                  `Área (hectáreas)` = value/1e4) %>% 
+                           rename(`Área (metros cuadrados)` = value)) %>% 
+  bind_rows(.id = 'Orden de red')
+cuencas_sub_areas_ordenes_r <- cuencas_sub_areas_ordenes %>%
+  group_by(`Orden de red`) %>% 
+  summarise(describe(`Área (kilómetros cuadrados)`, type = 2)) %>% 
+  select(-`vars`, -trimmed, -mad, -se) %>%
+  select(`Orden de red`, `Número` = n, `Media (km${^2}$)` = mean,
+         `Mediana (km${^2}$)` = median, `Desv. estándar (km${^2}$)` = sd,
+         `Mínimo (km${^2}$)` = min, `Máximo (km${^2}$)` = max,
+         `Rango (km${^2}$)` = range, Sesgo = skew,
+         Curtosis = kurtosis)
+cuencas_sub_areas_ordenes_p <- cuencas_sub_areas_ordenes %>%
+  mutate(`tamaño` = scales::rescale(as.numeric(`Orden de red`), to = c(1, 10))) %>% 
+  ggplot +
+  aes(x = `Orden de red`, y = `Área (kilómetros cuadrados)`) +
+  geom_jitter(alpha = 0.2, height = 0, width = 0.05
+              , aes(color = `Orden de red`, fill = `Orden de red`, size = `tamaño`)
+              ) +
+  geom_violin(alpha = 0.6, width = 0.8, color = "transparent", fill = "gray"
+              , aes(color = `Orden de red`)
+              ) +
+  geom_boxplot(alpha = 0, width = 0.3, color = "#808080") +
+  scale_y_continuous(trans = 'log2', labels = decimales_y_enteros) +
+  scale_size_continuous(range = c(1,3)) +
+  theme_bw() +
+  theme(legend.position = 'none', text = element_text(size = 18))
+png('figuras/cuencas-subcuencas-areas-ordenes-boxplot.png',
+    width = 3500, height = 2400, res = 450)
+cuencas_sub_areas_ordenes_p
+invisible(dev.off())
+```
+
+Obtuvimos los mapas de cuencas y subcuencas para cada orden con el paquete `tmap`. Primero, extrajimos los límites del país hacia el directorio `gpkg-shp` para disponer de un contexto en los mapas generados a continuación.
+
+```{bash, eval=F}
+# Generar GPKG de máscara
+v.out.ogr --overwrite \
+  input=mascara \
+  output=gpkg-shp/mascara.gpkg \
+  type=area \
+  format=GPKG
+```
+
+Importamos la máscara, y generamos los campos necesarios para realizar el panel de mapas de las cuencas y subcuencas de cada orden (8 mapas). Para ello, a partir de la lista de objetos `sf` conteniendo las cuencas y subcuencas, generamos un objeto único y convertimos de metros a kilómetros cuadrados. Posteriormente, generamos el objeto de panel de mapas con `tmap`.
+
+
+```{r, message=F, warning=F}
+# Máscara
+mascara <- st_read('gpkg-shp/mascara.gpkg')
+# Objeto sf de las cuencas de todos los órdenes
+cuencas_sub_areas_ordenes_sf <- map(cuencas_subcuencas, ~.['area'] %>%
+                           mutate(`Área (kilómetros cuadrados)` = area/1e6,
+                                  `Área (hectáreas)` = area/1e4) %>% 
+                           rename(`Área (metros cuadrados)` = area)) %>% 
+  bind_rows(.id = 'Orden de red')
+# Objeto sf de los linderos de las cuencas, en objeto de tipo MULTILINESTRING
+cuencas_sub_areas_ordenes_lines_sf <- cuencas_sub_areas_ordenes_sf %>% 
+  select(orden = `Orden de red`) %>% 
+  mutate(grosor = ifelse(orden %in% 1:3, 0, 0.1)) %>% 
+  mutate(orden = paste('Orden', orden)) %>% 
+  st_cast('MULTILINESTRING')
+# Mapa en tmap
+cuencas_sub_areas_ordenes_tm <- cuencas_sub_areas_ordenes_sf %>%
+  select(orden=`Orden de red`, `km cuad.` = `Área (kilómetros cuadrados)`) %>% 
+  mutate(grosor = ifelse(orden %in% 1:2, 0.0001, 0.1)) %>% 
+  mutate(orden = paste('Orden', orden)) %>%
+  tm_shape() +
+  tm_fill(col='km cuad.', palette = "YlOrBr", style = 'quantile') +
+  tm_facets(by = "orden", ncol = 4, nrow = 2, free.coords = FALSE, free.scales = TRUE) +
+  tm_shape(cuencas_sub_areas_ordenes_lines_sf) +
+  tm_lines(lwd = 'grosor', col = 'grey80', legend.lwd.show = F) +
+  tm_facets(by = "orden", ncol = 4, nrow = 2, free.coords = FALSE, free.scales = TRUE) +
+  tm_layout(panel.label.size = 2.5, legend.stack = "horizontal",
+            legend.title.size = 2, legend.text.size = 1.5) + 
+  tm_shape(shp = mascara) +
+  tm_borders(col = 'black', lwd = 0.8)
+```
+
+El bloque de código a continuación no se reproduce durante el tejido, pues la exportación del mapa a formato PNG consume varios minutos de cómputo, lo cual retardaría innecesariamente el tejido. Se recomienda ejecutarlo manualmente cuando se necesite actualizar el panel de mapas de las cuencas y subcuencas según órdenes generado por `tmap`.
+
+```{r, eval=F}
+# Mapa en PNG
+tmap_save(
+  tm = cuencas_sub_areas_ordenes_tm,
+  filename = "figuras/cuencas-subcuencas-areas-ordenes.png",
+  width = 4200, height = 3000, dpi = 200)
+```
+
+Visualizamos la red a partir del archivo fuente correspondiente (nombre raíz `rstream_orden_de_red_umbral_80_cleaned`), localizado en el directorio `gpkg-shp` del conjunto de datos suplementarios (existen dos versiones idénticas en formatos GeoPackage y Shapefile). También probamos con el mapa del mismo nombre desde la base de datos de GRASS GIS en QGIS, lo cual resultó ser más eficiente. Adicionalmente, cargamos los estadísticos hortonianos y desagregados de la red, generados con el addon `r.stream.stats`, a la sesión de `R`, para posteriormente explorar patrones a escala nacional y según órdenes de red.
+
+```{r}
+redes_ord_nombres_columnas <- c(
+    'Orden de red', 'Número de cursos', 'Longitud promedio (km)',
+    'Área promedio (km$^2$)', 'Pendiente promedio, celda a celda (m/m)',
+    'Gradiente promedio, nacimiento a desembocadura (m/m)',
+    'Diferencia de elevación promedio (m)',
+    'Longitud total (km)', 'Área total (km$^2$)'
+)
+# Horton
+redes_ord_horton <- read.csv(
+  file = 'estadisticos/stats_rstream_order_strahler_red_umbral_80_horton.txt',
+  skip = 1, header = TRUE) %>% 
+  setNames(redes_ord_nombres_columnas)
+# Razón de bifurcación a partir de promedio
+redes_ord_horton_rb_prom <- with(
+  data = redes_ord_horton,
+  expr = mean(`Número de cursos`[-length(`Número de cursos`)]/
+                `Número de cursos`[-1]))
+# Razón de bifuración a partir de coeficientes de regresión
+redes_ord_horton_rb_regr <- 1/10^lm(log10(`Número de cursos`) ~ `Orden de red`,
+                               data = redes_ord_horton)$coefficients[[2]]
+# Globales
+redes_res <- extraer_rstream_stats(
+  archivo = 'estadisticos/stats_rstream_order_strahler_red_umbral_80.txt',
+  inicio = 3, fin = 5, dos_filas = T) %>%
+  setNames(c(
+    'Orden máximo', 'Número total de cursos', 'Longitud total de cursos',
+    'Área total (km$^2$)', 'Densidad de drenaje (km/km$^2$)', 'Frecuencia de cursos (num/km$^2$)')
+  )
+redes_res_dd <- redes_res$`Densidad de drenaje (km/km$^2$)`
+# Según órdenes: promedios de longitud, área,
+# pendiente/gradiente y diferencia de elevación
+redes_ord_long_area_pend_ele <- extraer_rstream_stats(
+  archivo = 'estadisticos/stats_rstream_order_strahler_red_umbral_80.txt',
+  inicio = 16, fin = 24, dos_filas = T) %>%
+  setNames(redes_ord_nombres_columnas[c(1,3:7)])
+# Según órdenes: desviaciones estándar de longitud,
+# área, pendiente/gradiente y diferencia de elevación
+redes_ord_long_area_pend_ele_desv <- extraer_rstream_stats(
+  archivo = 'estadisticos/stats_rstream_order_strahler_red_umbral_80.txt',
+  inicio = 26, fin = 34, dos_filas = T) %>%
+  setNames(c(
+    redes_ord_nombres_columnas[1],
+    paste(redes_ord_nombres_columnas[c(3:7)], '($\\sigma$)')))
+# Según órdenes: totales de número de cursos, longitud y área
+redes_ord_totales_num_long_area <- extraer_rstream_stats(
+  archivo = 'estadisticos/stats_rstream_order_strahler_red_umbral_80.txt',
+  inicio = 36, fin = 43, dos_filas = F) %>%
+  setNames(c(
+    redes_ord_nombres_columnas[1:2],
+    redes_ord_nombres_columnas[8:9])
+    )
+# Unir estadísticos según órdenes
+redes_ord_final <- Reduce(function(x, y) merge(x, y, by = "Orden de red"), 
+                      list(redes_ord_long_area_pend_ele, 
+                           redes_ord_long_area_pend_ele_desv, 
+                           redes_ord_totales_num_long_area))
+
+# Razones, cocientes, ratios (bifurcación, longitud, pendiente, densidad de drenaje, frecuencia)
+redes_ord_razones <- extraer_rstream_stats(
+  archivo = 'estadisticos/stats_rstream_order_strahler_red_umbral_80.txt',
+  inicio = 45, fin = 52, dos_filas = F) %>%
+  setNames(
+    c(
+      redes_ord_nombres_columnas[1],
+      'Razón de bifurcación',
+      paste('Razón de',
+            tolower(
+              gsub(' promedio| \\(.*$|, celda.*$|, nacimiento.*$', '',
+                   redes_ord_nombres_columnas[3:6]))),
+      'Densidad de drenaje (km/km$^2$)',
+      'Frecuencia de cursos'
+    )
+  )
+asignar_valores_df_a_objetos(
+  df = redes_ord_razones %>%
+    select(matches('orden|bifurca|densidad')),
+  nombre_dataset = 'razones',
+  agrupar_por = 'Orden de red',
+  forzar = T)
+## Borrar objetos RR_* (sólo para uso interactivo)
+# rm(list = grep('RR_*', ls(), value = T))
+```
+
+A continuación, generamos tablas y gráficos relevantes de las variables de red.
+
+```{r}
+# Primero calculamos los errores estándar de cada variable
+redes_ord_final_con_ee <- redes_ord_final %>% 
+  inner_join(
+    redes_ord_final %>%
+      select(matches("Orden de red|Número de cursos|sigma")) %>% 
+      pivot_longer(
+        cols = -c(`Número de cursos`, `Orden de red`),
+        names_to = c("variable", ".value"),
+        names_pattern = "(.*) (\\(\\$\\\\sigma\\$\\))") %>% 
+      mutate(
+        se = `($\\sigma$)` / sqrt(`Número de cursos`)) %>%
+      pivot_wider(
+        id_cols = c(`Orden de red`, `Número de cursos`),
+        names_from = variable,
+        values_from = se,
+        names_glue = "{variable} (error est.)")) %>%
+  relocate(`Número de cursos`, `Longitud total (km)`,
+           `Área total (km$^2$)`, .after = 'Orden de red')
+# Luego generamos una tabla sólo con promedios y errores estándar
+redes_ord_final_promedios_ee <- redes_ord_final_con_ee %>%
+  select(matches('Orden|Número|total|promedio|error est.'),
+         -matches('sigma'))
+
+
+# Generar objetos  resumen para RMD
+asignar_valores_df_a_objetos(
+  df = redes_ord_final_promedios_ee %>%
+    select(matches('orden|numero|promedio.*m\\)$|promedio.*\\$)$')),
+  nombre_dataset = 'redes_ord_final_promedios_ee',
+  forzar = T)
+## Borrar objetos RR_* (sólo para uso interactivo)
+# rm(list = grep('RR_*', ls(), value = T))
+
+
+# Finalmente una tabla resumen reorganizada
+redes_ord_final_promedios_ee_r <- redes_ord_final_promedios_ee %>% 
+  select(matches('Orden|promedio|error est.')) %>% 
+  rename_with(.cols = matches('m\\)$|2\\$\\)$'), ~ paste0(., ' (promedio)')) %>% 
+  pivot_longer(
+    cols = -`Orden de red`,
+    names_to = c(".value", "medida"),
+    names_pattern = "(.*) \\((.*)\\)$"
+  ) %>% 
+  pivot_longer(
+    cols = -c(`Orden de red`, `medida`),
+    names_to = 'variable',
+    values_to = 'valor') %>% 
+  pivot_wider(names_from = 'medida', values_from = 'valor') %>% 
+  mutate(`Orden de red` = as.factor(`Orden de red`))
+# Tabla totales
+redes_ord_final_totales_tabla <- redes_ord_final_promedios_ee %>% 
+  select(`Orden de red`, `Número de cursos`,
+         `Longitud total (km)`) %>% 
+  mutate(`Orden de red` = factor(`Orden de red`)) %>% 
+  adorn_totals()
+redes_ord_final_totales_tabla_total_cursos <- with(
+  redes_ord_final_totales_tabla,
+     `Número de cursos`[`Orden de red` == "Total"])
+redes_ord_final_totales_tabla_total_longitud <- with(
+  redes_ord_final_totales_tabla,
+     `Longitud total (km)`[`Orden de red` == "Total"])
+redes_ord_final_totales_tabla_total_cursos_1a4 <- sum(with(
+  redes_ord_final_totales_tabla,
+     `Número de cursos`[`Orden de red` %in% 1:4]))
+redes_ord_final_totales_tabla_total_longitud_1a4 <- sum(with(
+  redes_ord_final_totales_tabla,
+     `Longitud total (km)`[`Orden de red` %in% 1:4]))
+redes_ord_final_totales_orden_max <- max(
+  as.integer(redes_ord_final_promedios_ee$`Orden de red`))
+# Tabla promedios
+redes_ord_final_promedios_ee_r_tabla <- redes_ord_final_promedios_ee_r %>%
+  mutate(`Promedio (error est.)` = paste0(
+    signif(promedio, 2), ' (',
+    signif(`error est.`, 1), ')')) %>% 
+  select(-promedio, -`error est.`) %>% 
+  mutate(variable = gsub(
+    ' promedio|, celda a celda|, nacimiento a desembocadura', '', variable)) %>% 
+  pivot_wider(
+    names_from = 'variable',
+    values_from = 'Promedio (error est.)')
+# Gráfico
+redes_ord_final_promedios_ee_r_p <- redes_ord_final_promedios_ee_r %>% 
+  mutate(variable = factor(
+    x = variable,
+    levels = c(
+      "Longitud promedio (km)",
+      "Área promedio (km$^2$)",
+      "Pendiente promedio, celda a celda (m/m)",
+      "Gradiente promedio, nacimiento a desembocadura (m/m)",
+      "Diferencia de elevación promedio (m)"
+    ),
+    labels = c(
+      "Longitud~(km)",
+      "Área~(km^2)",
+      "atop('Pendiente', 'celda a celda (m/m)')",
+      "atop('Gradiente desde nacimiento', 'a desembocadura (m/m)')",
+      "Diferencia~de~elevación~(m)"
+    ))) %>% 
+  ggplot + aes(x=`Orden de red`, y = promedio) +
+  geom_errorbar(
+    aes(ymin = promedio - `error est.`, ymax = promedio + `error est.`),
+    colour = "grey30", width = .3) +
+  geom_point(size=2, shape=21, fill="white") + 
+  facet_wrap(~ variable, scales = 'free_y', nrow = 1,
+             labeller = label_parsed) +
+  ylab('valor') +
+  theme_bw()
+png('figuras/variables-de-redes-segun-ordenes.png', width = 3000, height = 1000, res = 300)
+redes_ord_final_promedios_ee_r_p
+invisible(dev.off())
+```
+
+También calculamos los cursos más largos de ríos dominicanos seleccionados con el complemento `r.accumulate`. Como criterio de selección, elegimos ríos de orden seis o mayores, de forma general, pero también incluimos otros de orden cinco y uno de orden cuatro, para garantizar mayor representatividad en el territorio dominicano. De los ríos seleccionados, digitalizamos sus desembocaduras manualmente, observando el mapa de dirección de flujo y la red extraída con `r.stream.extract`. Este paso nos permitió elegir un punto idóneo de desembocadura, pues el algoritmo `r.accumulate` no admite puntos fuera de la red ni puntos sin flujo dirigido. Este proceso podíamos hacerlo automáticamente, pero preferimos la edición manual, dado que nos permitió recorrer la red íntegramente, y porque nos permitió elegir sitios de desembocadura personalizados para asegurar extraer cursos representativos.
+
+```{bash, eval=F}
+# Importar desembocaduras
+v.import --overwrite input=desembocaduras-rios-grandes.gpkg \
+  output=desembocaduras_rios_grandes
+# Generar cursos más largos
+time r.accumulate --overwrite \
+  direction=rstream_direccion_umbral_80 \
+  outlet=desembocaduras_rios_grandes \
+  outlet_id_column=cat id_column=lfp_id \
+  longest_flow_path=cursos_mas_largos
+# Actualizar base de datos con la longitud de los cursos
+v.to.db --overwrite option=length type=line columns=longitud \
+  map=cursos_mas_largos
+
+# Generar salidas GPKG y SHP para cursos más largos y sus desembocaduras
+## Exportar el mapa 'cursos_mas_largos' a GeoPackage
+v.out.ogr --overwrite \
+  input=cursos_mas_largos \
+  output=gpkg-shp/cursos_mas_largos.gpkg \
+  type=line \
+  format=GPKG
+## Exportar el mapa 'cursos_mas_largos' a Shapefile
+## Nota: algunos valores de área de objetos no se transfieren bien al formato SHP
+ogr2ogr -f "ESRI Shapefile" \
+  gpkg-shp/cursos_mas_largos.shp \
+  gpkg-shp/cursos_mas_largos.gpkg
+## Exportar el mapa 'desembocaduras_rios_grandes' a GeoPackage
+v.out.ogr --overwrite \
+  input=desembocaduras_rios_grandes \
+  output=gpkg-shp/desembocaduras_rios_grandes.gpkg \
+  type=point \
+  format=GPKG
+## Exportar el mapa 'cursos_mas_largos' a Shapefile
+## Nota: algunos valores de área de objetos no se transfieren bien al formato SHP
+ogr2ogr -f "ESRI Shapefile" \
+  gpkg-shp/desembocaduras_rios_grandes.shp \
+  gpkg-shp/desembocaduras_rios_grandes.gpkg
+```
+
+Finalmente, generamos un mapa vectorial único conteniendo la cuenca íntegra (ya generada) y su segregación entre los dos países, República Dominicana y Haití.
+
+```{bash, eval=F}
+# Importar frontera
+v.import --overwrite input=frontera.gpkg \
+  output=frontera
+# Segregar
+v.type --overwrite input=mascara out=mascara_limite from=boundary to=line
+v.patch --overwrite input=mascara_limite,frontera out=parches_frontera
+v.type --overwrite input=parches_frontera out=mascara_limite_nuevo
+v.centroids --overwrite input=mascara_limite_nuevo out=cuenca_dajabon_integra_y_parcial
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Importamos los cursos más largos generados a R, eliminando a su vez los duplicados.
+
+```{r, message=F, warning=F}
+# Cursos más largos
+cursos_mas_largos <- st_read(
+  dsn = 'gpkg-shp/cursos_mas_largos.gpkg',
+  quiet = T)
+# Eliminar duplicados
+cursos_mas_largos_sindup <- cursos_mas_largos[!duplicated(cursos_mas_largos$lfp_id),]
+```
+
+A continuación, recuperamos los atributos de las cuencas a las que pertenecen los cursos más largos seleccionados. Para esto fue necesario quitar algunos nodos en las puntas de los cursos más largos con la función personalizada `quitar_puntas`, para asegurarnos de que los cursos se inscribían íntegramente en las cuencas.
+
+
+```{r}
+# Crear una copia
+cursos_mas_largos_sin_puntas <- cursos_mas_largos_sindup
+
+# Recorremos cada línea en el objeto sf
+for (i in seq_len(nrow(cursos_mas_largos_sin_puntas))) {
+  # Extraer la línea actual
+  linea_actual <- cursos_mas_largos_sin_puntas[i,]
+  
+  # Quitar los nodos
+  linea_modificada <- quitar_puntas(st_geometry(linea_actual), n = 500)
+  
+  # Actualizar la línea en el objeto sf
+  st_geometry(cursos_mas_largos_sin_puntas)[i] <- linea_modificada
+}
+```
+
+Posteriormente, realizamos la correspondiente unión espacial y generamos un objeto de cursos más largos completo, que incluye la información original y la de las cuencas en las que se inscriben. Exportamos a formato GeoPackage el objeto con información de cuencas.
+
+```{r, message=F, warning=F}
+# Unión espacial con cuencas para obtener sus atributos
+cursos_mas_largos_sin_puntas_cuencas <- st_join(
+  x = cursos_mas_largos_sin_puntas,
+  y = cuencas4mas %>% select(-value, -label) %>% rename(id_cuenca = cat),
+  join = st_covered_by)
+
+# Objeto completo con datos de cuenca
+cursos_mas_largos_completo <- cursos_mas_largos_sindup %>%
+  inner_join(cursos_mas_largos_sin_puntas_cuencas %>% st_drop_geometry()) %>% 
+  mutate(`nombre_y_strahler` = paste0(nombre, ' (orden ', strahler, ')'))
+st_geometry(cursos_mas_largos_completo) <- 'geometry'
+st_write(
+  obj = cursos_mas_largos_completo, delete_dsn = T,
+  dsn = 'gpkg-shp/cursos_mas_largos_con_info_cuencas.gpkg')
+# Generar mapa
+cursos_mas_largos_completo_p <- cursos_mas_largos_completo %>% 
+  mutate(etiqueta = str_replace(nombre_y_strahler, "\\(o", "\n\\(o")) %>%
+  mutate(etiqueta = str_replace(etiqueta, 'Macabóncito', 'Macaboncito')) %>% 
+  mutate(etiqueta = str_wrap(nombre_y_strahler, width = 15)) %>%
+  ggplot + aes() +
+  geom_sf(data = mascara, fill = 'transparent',
+          color = 'grey50', lwd = 0.6) +
+  geom_sf(color = 'blue', lwd = 0.6) +
+  # ggsflabel::geom_sf_label_repel(
+  #   aes(label = etiqueta), fontface = 'bold', colour = 'grey30', 
+  #   size = 3, fill = alpha("white", 0.7), max.overlaps = 15,
+  #   force = 50, seed = 60) +
+  ggsflabel::geom_sf_text_repel(
+    aes(label = etiqueta), fontface = 'bold', colour = alpha('black', 0.7), 
+    size = 3, bg.colour = alpha("white", 0.3), bg.r = .2, max.overlaps = 15,
+    force = 40, seed = 60) +
+  theme_bw() + 
+  theme(plot.title = element_text(size = 11)) +
+  ggspatial::annotation_scale(style = 'ticks')
+png('figuras/cursos-mas-largos.png',
+    width = 3500, height = 2400, res = 300)
+cursos_mas_largos_completo_p
+invisible(dev.off())
+# Tabla
+cursos_mas_largos_completo_tabla <- cursos_mas_largos_completo %>% 
+  st_drop_geometry() %>% 
+  arrange(desc(longitud)) %>% 
+  mutate(longitud = signif(longitud/1000, digits = 4)) %>%
+  select(Nombre = nombre, `Longitud (km)` = longitud, `Orden máximo` = strahler)
+# Generar objetos  resumen para RMD
+asignar_valores_df_a_objetos(
+  df = cursos_mas_largos_completo_tabla,
+  nombre_dataset = 'clargos',
+  agrupar_por = 'Nombre', forzar = T)
+## Borrar objetos RR_* (sólo para uso interactivo)
+# rm(list = grep('RR_*', ls(), value = T))
+```
+
+
+
+
+## Informe de la sesión de R {.unnumbered}
+
+```{r}
+sessionInfo()
+```

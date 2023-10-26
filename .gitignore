@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+fuentes
+salidas/*
+!salidas/gpkg-shp/
+!salidas/gpkg-shp/*
